@@ -32,6 +32,9 @@ describe("headers [#" .. strategy .. "]", function()
       bp = helpers.get_db_utils(strategy, {
         "routes",
         "services",
+      }, {
+        "error-generator",
+        "error-generator-last",
       })
     end)
 
@@ -235,7 +238,6 @@ describe("headers [#" .. strategy .. "]", function()
     end)
   end)
 
-
   describe("X-Kong-Proxy-Latency/X-Kong-Upstream-Latency", function()
     local proxy_client
     local bp
@@ -246,11 +248,58 @@ describe("headers [#" .. strategy .. "]", function()
           hosts = { "headers-inspect.com" },
         }
 
-        config = config or {}
-        config.database   = strategy
-        config.nginx_conf = "spec/fixtures/custom_nginx.template"
+        local service = bp.services:insert({
+          protocol = helpers.mock_upstream_protocol,
+          host     = helpers.mock_upstream_host,
+          port     = 1, -- wrong port
+        })
 
-        assert(helpers.start_kong(config))
+        bp.routes:insert({
+          service = service,
+          hosts = { "502.test" }
+        })
+
+        local rewrite_error_route = bp.routes:insert {
+          hosts = { "error-rewrite.test" },
+        }
+
+        bp.plugins:insert {
+          name = "error-generator",
+          route = { id = rewrite_error_route.id },
+          config = {
+            rewrite = true,
+          },
+        }
+
+        local access_error_route = bp.routes:insert {
+          hosts = { "error-access.test" },
+        }
+
+        bp.plugins:insert {
+          name = "error-generator",
+          route = { id = access_error_route.id },
+          config = {
+            rewrite = true,
+          },
+        }
+
+        local header_filter_error_route = bp.routes:insert {
+          hosts = { "error-header-filter.test" },
+        }
+
+        bp.plugins:insert {
+          name = "error-generator",
+          route = { id = header_filter_error_route.id },
+          config = {
+            header_filter = true,
+          },
+        }
+
+        assert(helpers.start_kong({
+          database   = strategy,
+          nginx_conf = "spec/fixtures/custom_nginx.template",
+          plugins = "bundled,error-generator,error-generator-last",
+        }, nil, true))
       end
     end
 
@@ -258,9 +307,11 @@ describe("headers [#" .. strategy .. "]", function()
       bp = helpers.get_db_utils(strategy, {
         "routes",
         "services",
+      }, {
+        "error-generator",
+        "error-generator-last",
       })
     end)
-
 
     before_each(function()
       proxy_client = helpers.proxy_client()
@@ -276,7 +327,9 @@ describe("headers [#" .. strategy .. "]", function()
 
       lazy_setup(start())
 
-      lazy_teardown(helpers.stop_kong)
+      lazy_teardown(function()
+        helpers.stop_kong(nil, true)
+      end)
 
       it("should be returned when request was proxied", function()
         local res = assert(proxy_client:send {
@@ -305,6 +358,79 @@ describe("headers [#" .. strategy .. "]", function()
         assert.is_nil(res.headers[constants.HEADERS.UPSTREAM_LATENCY])
         assert.is_nil(res.headers[constants.HEADERS.PROXY_LATENCY])
       end)
+
+      it("#new should be returned when response status code is included in error_page directive (error_page not executing)", function()
+        for _, code in ipairs({ 400, 404, 408, 411, 412, 413, 414, 417, 494, 500, 502, 503, 504 }) do
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/status/" .. code,
+            headers = {
+              host  = "headers-inspect.com",
+            }
+          })
+
+          local body = assert.res_status(code, res)
+          assert.is_not_nil(res.headers[constants.HEADERS.UPSTREAM_LATENCY])
+          assert.is_not_nil(res.headers[constants.HEADERS.PROXY_LATENCY])
+        end
+      end)
+
+      it("#new should be returned with 502 errors (error_page executing)", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/get",
+          headers = {
+            host  = "502.test",
+          }
+        })
+
+        local body = assert.res_status(502, res)
+        assert.is_not_nil(res.headers[constants.HEADERS.UPSTREAM_LATENCY])
+        assert.is_not_nil(res.headers[constants.HEADERS.PROXY_LATENCY])
+      end)
+
+      it("#new should be returned even when plugin errors on (rewrite phase)", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/get",
+          headers = {
+            host  = "error-rewrite.test",
+          }
+        })
+
+        local body = assert.res_status(500, res)
+        assert.is_not_nil(res.headers[constants.HEADERS.UPSTREAM_LATENCY])
+        assert.is_not_nil(res.headers[constants.HEADERS.PROXY_LATENCY])
+      end)
+
+      it("#new should be returned even when plugin errors on (access phase)", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/get",
+          headers = {
+            host  = "error-access.test",
+          }
+        })
+
+        local body = assert.res_status(500, res)
+        assert.is_not_nil(res.headers[constants.HEADERS.UPSTREAM_LATENCY])
+        assert.is_not_nil(res.headers[constants.HEADERS.PROXY_LATENCY])
+      end)
+
+      it("#new should be returned even when plugin errors on (header filter phase)", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/get",
+          headers = {
+            host  = "error-header-filter.test",
+          }
+        })
+
+        local body = assert.res_status(500, res)
+        assert.is_not_nil(res.headers[constants.HEADERS.UPSTREAM_LATENCY])
+        assert.is_not_nil(res.headers[constants.HEADERS.PROXY_LATENCY])
+      end)
+
 
     end)
 
